@@ -1,0 +1,18 @@
+./configure \
+    --prefix=/usr/local/tengine \
+    --with-http_ssl_module \
+    --with-http_v2_module \
+    --with-http_realip_module \
+    --with-jemalloc \
+    --with-cpu-opt=amd64 \
+    --with-cc-opt='-fpie -g -O0 -Wall -Wp,-D_FORTIFY_SOURCE=0 -fexceptions -fstack-protector --param=ssp-buffer-size=4 -m64 -mtune=generic' \
+    --with-http_v2_module \
+    --with-http_stub_status_module \
+    --with-pcre-opt=-fPIC \
+    --with-pcre-jit \
+    --with-openssl-async \
+    --with-debug \
+    --add-module=./modules/ngx_http_upstream_check_module \
+    --add-module=./modules/ngx_http_upstream_session_sticky_module \
+    --add-module=./modules/ngx_http_reqstat_module
+
