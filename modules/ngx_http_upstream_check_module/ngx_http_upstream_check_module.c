@@ -19,7 +19,7 @@ typedef struct ngx_http_upstream_check_srv_conf_s
 ngx_http_upstream_check_srv_conf_t;
 
 static ngx_int_t
-ngx_http_upstream_check_http_parse_https_tls_hk_parse(ngx_http_upstream_check_peer_t *peer);
+ngx_http_upstream_check_https_parse(ngx_http_upstream_check_peer_t *peer);
 
 #if (NGX_HAVE_PACK_PRAGMA)
 #pragma pack(push, 1)
@@ -206,15 +206,11 @@ typedef struct SSL_Box {
     ngx_event_t     *event;
 } SSL_Box;
 
-static void
-ngx_http_upstream_check_send_handler_https_tls_hk_send(ngx_event_t *event);
-static void
-ngx_http_upstream_check_send_handler_https(ngx_event_t *event);
-//static void ngx_http_upstream_check_recv_handler_https_tls_hk_recv(ngx_event_t *event);
-//static void ngx_http_upstream_check_send_handler_https_tls_req(ngx_event_t *event);
+static void ngx_http_upstream_check_send_https_hk(ngx_event_t *event);
+static void ngx_http_upstream_check_send_https(ngx_event_t *event);
 
-static void ngx_http_upstream_check_https_conn_and_send_handler(ngx_event_t *event);
-static void ngx_http_upstream_check_https_recv_handler(ngx_event_t *event);
+static void ngx_http_upstream_check_send_https_handler(ngx_event_t *event);
+static void ngx_http_upstream_check_recv_https_handler(ngx_event_t *event);
 
 
 #define NGX_HTTP_CHECK_TCP                   0x0001
@@ -820,10 +816,10 @@ static ngx_check_conf_t  ngx_check_types[] = {
         ngx_string("https"),
         ngx_string("GET / HTTP/1.0\r\n\r\n"),
         NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_2XX | NGX_CHECK_HTTP_3XX,
-        ngx_http_upstream_check_https_conn_and_send_handler,
-        ngx_http_upstream_check_https_recv_handler,
+        ngx_http_upstream_check_send_https_handler,
+        ngx_http_upstream_check_recv_https_handler,
         ngx_http_upstream_check_http_init,
-        ngx_http_upstream_check_http_parse_https_tls_hk_parse,
+        ngx_http_upstream_check_https_parse,
         ngx_http_upstream_check_http_reinit,
         1,
         1 },
@@ -1921,9 +1917,8 @@ void flush_wbio(SSL_Box* box) {
 
     memcpy(box->_buffer_send, buffer, total);
     box->_buffer_send_size = total;
-    box->send(box->event);                         // hankai1.2 发送exch时 阻塞 TODO
+    box->send(box->event);                                          // tls hankai1.3 发送client hello
 
-    // reset pos last todo
     ngx_http_upstream_check_ctx_t *ctx = box->peer->check_data;
     ctx->send.pos = ctx->send.last = ctx->send.start;
     box->_buffer_send_size = 0;
@@ -1938,11 +1933,12 @@ void box_flush(SSL_Box* box)
         return;
     }
     box->_is_flush = 1; 
-    flush_rbio(box);
+    flush_rbio(box);                                                // tls hankai2.4 server_hello虽已入bio但上层读不出东西
     //if (!SSL_is_init_finished(box->_ssl)
     //        || box->_buffer_send[0] == '\0') {
         if (!SSL_is_init_finished(box->_ssl)) {
-        flush_wbio(box);
+        flush_wbio(box);                                            // tls hankai1.2 拿到ssl库提供的client hello 调用send接口
+                                                                    // tls hankai2.4 触发客户端发送new_exchange
         box->_is_flush = 0; 
         return;
     }
@@ -1961,7 +1957,6 @@ void box_flush(SSL_Box* box)
         }
 
         if (offset != size) {
-            //HAMMER_LOG_WARN(g_logger) << "Ssl error on SSL_write: " << SSLUtil::getLastError();
             //shutdown();
             //break;
         }
@@ -1969,20 +1964,19 @@ void box_flush(SSL_Box* box)
     box->_is_flush = 0; 
 }
 
-void box_on_recv(SSL_Box *box, uint8_t *buf, size_t size)
+void box_on_recv(SSL_Box *box, uint8_t *buf, size_t size)           // tls hankai2.1 接受server hello
 {
     if (size <= 0) {
         return;
     }
     uint32_t offset = 0;                                                                                          
-    while (offset < size) {
+    while (offset < size) {                                         // tls hankai2.2 server_hello写入bio
         int nwrite = BIO_write(box->_read_bio, buf + offset, size - offset);
         if (nwrite > 0) {
             offset += nwrite;
-            box_flush(box);
+            box_flush(box);                                         // tls hankai2.3 触发发送new_exchange
             continue;
         }
-        //HAMMER_LOG_WARN(g_logger) << "Ssl error on BIO_write: " << SSLUtil::getLastError();                       
         //shutdown();
         break;
     }
@@ -1995,14 +1989,14 @@ void box_on_send(SSL_Box *box, uint8_t *buf, size_t size)
     }
     if (!box->_send_handshake) {
         box->_send_handshake = 1;
-        SSL_do_handshake(box->_ssl);
+        //SSL_do_handshake(box->_ssl);
     }
     memcpy(box->_buffer_send, buf, size);
     box->_buffer_send_size = size;
     box_flush(box);
 }
 
-static void ngx_http_upstream_check_https_conn_and_send_handler(ngx_event_t *event)
+static void ngx_http_upstream_check_send_https_handler(ngx_event_t *event)      // tls hankai0 建链成功|可发数据
 {
     ngx_connection_t               *c;
     ngx_http_upstream_check_peer_t *peer;
@@ -2017,19 +2011,26 @@ static void ngx_http_upstream_check_https_conn_and_send_handler(ngx_event_t *eve
     int phase = peer->phase;
     if (phase == 0) {       // on connect
         peer->phase = 1;
-        return ngx_http_upstream_check_send_handler_https_tls_hk_send(event);   // tls hankai1 发送client hello
+        return ngx_http_upstream_check_send_https_hk(event);                    // tls hankai1 可发阶段1 发送client hello
     }
-    if (phase == 1) {       // on send
+    if (phase == 1) {
+        peer->phase = 2;
+        ngx_connection_t *c = event->data;
+        peer = c->data;
+        box_flush(peer->box);
+        return;
+    }
+    if (phase == 2) {       // on send
         ngx_connection_t *c = event->data;
         peer = c->data;
         uint8_t req[] = "GET / HTTP/1.0\r\n\r\n";
         box_on_send(peer->box, req, sizeof(req)/sizeof(req[0]));
-
-        //box_flush(peer->box);
+        peer->phase = 0;
+        return;
     }
 }
 
-static void ngx_http_upstream_check_https_recv_handler(ngx_event_t *event)      // tls hankai2 接受server hello
+static void ngx_http_upstream_check_recv_https_handler(ngx_event_t *event)      // tls hankai2 接受server hello
 {
     u_char                         *new_buf;
     ssize_t                         size, n;
@@ -2097,20 +2098,27 @@ static void ngx_http_upstream_check_https_recv_handler(ngx_event_t *event)      
             break;
         } else {
             c->error = 1;
-            return;
             goto check_recv_fail;
         }
     }
-    box_on_recv(peer->box, ctx->recv.pos, ctx->recv.last - ctx->recv.pos);
+
+    box_on_recv(peer->box, ctx->recv.pos, ctx->recv.last - ctx->recv.pos);      // tls hankai2.1 接受server hellow
 
     ctx->recv.pos = ctx->recv.last = ctx->recv.start;
 
+    //peer->state = NGX_HTTP_CHECK_RECV_DONE;
+    return;
+
 check_recv_fail:
+
+    ngx_http_upstream_check_status_update(peer, 0);
+    ngx_http_upstream_check_clean_event(peer);
+
     return;
 }
 
     static void
-ngx_http_upstream_check_send_handler_https_tls_hk_send(ngx_event_t *event)      // tls hankai1 调用ssl库 组client hello
+ngx_http_upstream_check_send_https_hk(ngx_event_t *event)                       // tls hankai1 调用ssl库 组client hello
 {
     ngx_connection_t               *c;
     ngx_http_upstream_check_peer_t *peer;
@@ -2145,8 +2153,8 @@ ngx_http_upstream_check_send_handler_https_tls_hk_send(ngx_event_t *event)      
     box->peer = peer;
     peer->box = box;
     box->event = event;
-    //box->parse = 
-    box->send = ngx_http_upstream_check_send_handler_https;
+    box->parse = ngx_http_upstream_check_https_parse;
+    box->send = ngx_http_upstream_check_send_https;
 
     SSL_set_tlsext_host_name(box->_ssl, "www.ifeng.com");
     //SSL_do_handshake(box->_ssl);
@@ -2154,14 +2162,13 @@ ngx_http_upstream_check_send_handler_https_tls_hk_send(ngx_event_t *event)      
     SSL_connect(box->_ssl);
     box->_is_flush = 0;
 
-    box_flush(box);     // tls hankai1.1 // wbio中触发 ngx_http_upstream_check_send_handler_https
+    box_flush(box);                                             // tls hankai1.1 // wbio中触发 ngx_http_upstream_check_send_https
 
-    //return ngx_http_upstream_check_send_handler_https(event);
     return;
 }
 
     static void
-ngx_http_upstream_check_send_handler_https(ngx_event_t *event)
+ngx_http_upstream_check_send_https(ngx_event_t *event)          // tls hankai1.3 发送client hello
 {
     ssize_t                         size;
     ngx_connection_t               *c;
@@ -2264,237 +2271,6 @@ check_send_fail:
     ngx_http_upstream_check_status_update(peer, 0);
     ngx_http_upstream_check_clean_event(peer);
 }
-
-/*
-    static void
-ngx_http_upstream_check_recv_handler_https_tls_hk_recv(ngx_event_t *event)
-{
-    u_char                         *new_buf;
-    ssize_t                         size, n;
-    ngx_int_t                       rc;
-    ngx_connection_t               *c;
-    ngx_http_upstream_check_ctx_t  *ctx;
-    ngx_http_upstream_check_peer_t *peer;
-
-    if (ngx_http_upstream_check_need_exit()) {
-        return;
-    }
-
-    c = event->data;
-    peer = c->data;
-
-    if (peer->state != NGX_HTTP_CHECK_SEND_DONE) {
-
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            goto check_recv_fail;
-        }
-
-        return;
-    }
-
-    ctx = peer->check_data;
-
-    if (ctx->recv.start == NULL) {
-        ctx->recv.start = ngx_palloc(c->pool, ngx_pagesize / 2);
-        if (ctx->recv.start == NULL) {
-            goto check_recv_fail;
-        }
-
-        ctx->recv.last = ctx->recv.pos = ctx->recv.start;
-        ctx->recv.end = ctx->recv.start + ngx_pagesize / 2;
-    }
-
-    while (1) {
-        n = ctx->recv.end - ctx->recv.last;
-
-        if (n == 0) {
-            size = ctx->recv.end - ctx->recv.start;
-            new_buf = ngx_palloc(c->pool, size * 2);
-            if (new_buf == NULL) {
-                goto check_recv_fail;
-            }
-
-            ngx_memcpy(new_buf, ctx->recv.start, size);
-
-            ctx->recv.pos = ctx->recv.start = new_buf;
-            ctx->recv.last = new_buf + size;
-            ctx->recv.end = new_buf + size * 2;
-
-            n = ctx->recv.end - ctx->recv.last;
-        }
-
-        size = c->recv(c, ctx->recv.last, n);
-
-#if (NGX_DEBUG)
-        {
-            ngx_err_t  err;
-
-            err = (size >= 0) ? 0 : ngx_socket_errno;
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, err,
-                    "http check recv size: %z, peer: %V ",
-                    size, &peer->check_peer_addr->name);
-        }
-#endif
-
-        if (size > 0) {
-            ctx->recv.last += size;
-            continue;
-        } else if (size == 0 || size == NGX_AGAIN) {
-            break;
-        } else {
-            c->error = 1;
-            goto check_recv_fail;
-        }
-    }
-
-    rc = peer->parse(peer);
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
-            "http check parse rc: %i, peer: %V ",
-            rc, &peer->check_peer_addr->name);
-
-    switch (rc) {
-
-        case NGX_AGAIN:
-            ngx_http_upstream_check_http_init(peer);
-            ngx_http_upstream_check_ctx_t       *ctx;
-            ctx = peer->check_data;
-            box_on_send(ctx->box, ctx->send.start, ctx->send.end - ctx->send.start);
-            ngx_http_upstream_check_send_handler_https_tls_req(event);    // todo1
-
-            return;
-
-        case NGX_ERROR:
-            ngx_log_error(NGX_LOG_ERR, event->log, 0,
-                    "check protocol %V error with peer: %V ",
-                    &peer->conf->check_type_conf->name,
-                    &peer->check_peer_addr->name);
-
-            ngx_http_upstream_check_status_update(peer, 0);
-            break;
-
-        case NGX_OK:
-
-        default:
-            ngx_http_upstream_check_status_update(peer, 1);
-            break;
-    }
-
-    peer->state = NGX_HTTP_CHECK_RECV_DONE;
-    ngx_http_upstream_check_clean_event(peer);
-    return;
-
-check_recv_fail:
-
-    ngx_http_upstream_check_status_update(peer, 0);
-    ngx_http_upstream_check_clean_event(peer);
-}
-
-    static void
-ngx_http_upstream_check_send_handler_https_tls_req(ngx_event_t *event)
-{
-    ssize_t                         size;
-    ngx_connection_t               *c;
-    ngx_http_upstream_check_ctx_t  *ctx;
-    ngx_http_upstream_check_peer_t *peer;
-
-    if (ngx_http_upstream_check_need_exit()) {
-        return;
-    }
-
-    c = event->data;
-    peer = c->data;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "http check send.");
-
-    if (c->pool == NULL) {
-        ngx_log_error(NGX_LOG_ERR, event->log, 0,
-                "check pool NULL with peer: %V ",
-                &peer->check_peer_addr->name);
-
-        goto check_send_fail;
-    }
-
-    if (peer->state != NGX_HTTP_CHECK_CONNECT_DONE) {
-        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
-
-            ngx_log_error(NGX_LOG_ERR, event->log, 0,
-                    "check handle write event error with peer: %V ",
-                    &peer->check_peer_addr->name);
-
-            goto check_send_fail;
-        }
-
-        return;
-    }
-
-    if (peer->check_data == NULL) {
-
-        peer->check_data = ngx_pcalloc(peer->pool,
-                sizeof(ngx_http_upstream_check_ctx_t));
-        if (peer->check_data == NULL) {
-            goto check_send_fail;
-        }
-
-        if (peer->init == NULL || peer->init(peer) != NGX_OK) {
-
-            ngx_log_error(NGX_LOG_ERR, event->log, 0,
-                    "check init error with peer: %V ",
-                    &peer->check_peer_addr->name);
-
-            goto check_send_fail;
-        }
-    }
-
-    ctx = peer->check_data;
-    SSL_Box* box = ctx->box;
-
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-            "http check send total: %z",
-            ctx->send.last - ctx->send.pos);
-
-
-    ctx->send.pos = box->_buffer_send;
-    ctx->send.last = box->_buffer_send + box->_buffer_send_size;
-
-    while (ctx->send.pos < ctx->send.last) {
-
-        size = c->send(c, ctx->send.pos, ctx->send.last - ctx->send.pos);
-
-#if (NGX_DEBUG)
-        {
-            ngx_err_t  err;
-
-            err = (size >=0) ? 0 : ngx_socket_errno;
-            ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, err,
-                    "http check send size: %z, total: %z",
-                    size, ctx->send.last - ctx->send.pos);
-        }
-#endif
-
-        if (size >= 0) {
-            ctx->send.pos += size;
-        } else if (size == NGX_AGAIN) {
-            return;
-        } else {
-            c->error = 1;
-            goto check_send_fail;
-        }
-    }
-
-    if (ctx->send.pos == ctx->send.last) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "http check send done.");
-        peer->state = NGX_HTTP_CHECK_SEND_DONE;
-        c->requests++;
-    }
-
-    return;
-
-check_send_fail:
-    ngx_http_upstream_check_status_update(peer, 0);
-    ngx_http_upstream_check_clean_event(peer);
-}
-*/
 
     static void
 ngx_http_upstream_check_send_handler(ngx_event_t *event)
@@ -2742,7 +2518,7 @@ ngx_http_upstream_check_http_init(ngx_http_upstream_check_peer_t *peer)
 }
 
     static ngx_int_t
-ngx_http_upstream_check_http_parse_https_tls_hk_parse(ngx_http_upstream_check_peer_t *peer)
+ngx_http_upstream_check_https_parse(ngx_http_upstream_check_peer_t *peer)
 {
     ngx_int_t                            rc;
     ngx_uint_t                           code, code_n;
@@ -2807,8 +2583,6 @@ ngx_http_upstream_check_http_parse_https_tls_hk_parse(ngx_http_upstream_check_pe
                 return NGX_ERROR;
             }
         } else {
-            // todo1 send http request
-            //ngx_http_upstream_check_send_handler(ngx_event_t *event)
             return NGX_AGAIN;
         }
     } else {
@@ -4987,6 +4761,7 @@ ngx_http_upstream_check_http_send(ngx_conf_t *cf, ngx_command_t *cmd,
         return NGX_CONF_ERROR;
     }
 
+    /*
     if (value[1].len
             && (ucscf->check_type_conf->name.len != 5
                 || ngx_strncmp(ucscf->check_type_conf->name.data,
@@ -4997,6 +4772,7 @@ ngx_http_upstream_check_http_send(ngx_conf_t *cf, ngx_command_t *cmd,
                 &ucscf->check_type_conf->name);
         return NGX_CONF_ERROR;
     }
+    */
 
     ucscf->send = value[1];
 

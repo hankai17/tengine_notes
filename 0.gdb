@@ -12,5 +12,11 @@ set print pretty
 #b box_send
 #b box_flush
 #b box_on_recv
-b flush_wbio 
-b ngx_http_upstream_check_module.c:2224
+#b flush_wbio 
+
+#b ngx_http_upstream_check_module.c:2096
+
+#b box_on_send
+b ngx_http_upstream_check_send_https_handler
+#b ngx_http_upstream_check_recv_https_handler
+
