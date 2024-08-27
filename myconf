@@ -12,6 +12,7 @@
     --with-pcre-jit \
     --with-openssl-async \
     --with-debug \
+    --with-stream \
     --add-module=./modules/ngx_http_upstream_check_module \
     --add-module=./modules/ngx_http_upstream_session_sticky_module \
     --add-module=./modules/ngx_http_reqstat_module
