@@ -22,7 +22,8 @@ set print pretty
 
 #b buffer_append_string
 #b ngx_http_upstream_check_https_parse
-b ngx_http_upstream_check_https_reinit
+#b ngx_http_upstream_check_https_reinit
+b ngx_http_upstream_check_https_send_hk
 
 
 #http进来几次

@@ -207,7 +207,7 @@ typedef struct SSL_Box {
 } SSL_Box;
 
 static void ngx_http_upstream_check_https_send_hk(ngx_event_t *event);
-static void ngx_http_upstream_check_send_https(ngx_event_t *event, uint8_t *buf, size_t len);
+static void ngx_http_upstream_check_https_send(ngx_event_t *event, uint8_t *buf, size_t len);
 
 static void ngx_http_upstream_check_https_send_handler(ngx_event_t *event);
 static void ngx_http_upstream_check_https_recv_handler(ngx_event_t *event);
@@ -2011,9 +2011,11 @@ static void ngx_http_upstream_check_https_send_handler(ngx_event_t *event)      
         peer->phase = 1;
         ngx_http_upstream_check_https_send_hk(event);                    // tls hankai1 可发阶段1 发送client hello
 
-        uint8_t req[] = "GET / HTTP/1.0\r\n\r\n";
-        box_on_send(peer->box, req, sizeof(req)/sizeof(req[0]));
-        event->active = 0;
+
+        ngx_http_upstream_check_srv_conf_t  *ucscf;
+        ucscf = peer->conf;
+        box_on_send(peer->box, (u_char *)ucscf->send.data, ucscf->send.len);
+        //event->active = 0;
         return;
     }
     /*
@@ -2150,21 +2152,23 @@ ngx_http_upstream_check_https_send_hk(ngx_event_t *event)                       
     peer->box = box;
     box->event = event;
     box->parse = ngx_http_upstream_check_https_parse;
-    box->send = ngx_http_upstream_check_send_https;
+    box->send = ngx_http_upstream_check_https_send;
 
-    SSL_set_tlsext_host_name(box->_ssl, "www.ifeng.com");
+    if (peer->conf->server_name.len > 0) {
+        SSL_set_tlsext_host_name(box->_ssl, peer->conf->server_name.data);
+    }
     //SSL_do_handshake(box->_ssl);
     //box->_send_handshake = 1;
     SSL_connect(box->_ssl);
     box->_is_flush = 0;
 
-    box_flush(box);                                             // tls hankai1.1 // wbio中触发 ngx_http_upstream_check_send_https
+    box_flush(box);                                             // tls hankai1.1 // wbio中触发 ngx_http_upstream_check_https_send
 
     return;
 }
 
     static void
-ngx_http_upstream_check_send_https(ngx_event_t *event, uint8_t *buf, size_t len)          // tls hankai1.3 发送client hello
+ngx_http_upstream_check_https_send(ngx_event_t *event, uint8_t *buf, size_t len)          // tls hankai1.3 发送client hello
 {
     ssize_t                         size;
     ngx_connection_t               *c;
