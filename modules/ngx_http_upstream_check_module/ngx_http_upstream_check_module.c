@@ -2010,7 +2010,7 @@ static void ngx_http_upstream_check_send_https_handler(ngx_event_t *event)      
 
     int phase = peer->phase;
     if (phase == 0) {       // on connect
-        peer->phase = 1;
+        peer->phase = 2;
         return ngx_http_upstream_check_send_https_hk(event);                    // tls hankai1 可发阶段1 发送client hello
     }
     if (phase == 1) {
@@ -2026,6 +2026,7 @@ static void ngx_http_upstream_check_send_https_handler(ngx_event_t *event)      
         uint8_t req[] = "GET / HTTP/1.0\r\n\r\n";
         box_on_send(peer->box, req, sizeof(req)/sizeof(req[0]));
         peer->phase = 0;
+        event->active = 0;
         return;
     }
 }
@@ -2544,14 +2545,14 @@ ngx_http_upstream_check_https_parse(ngx_http_upstream_check_peer_t *peer)
                     &ctx->recv,
                     &ctx->status);
             if (rc == NGX_AGAIN) {
-                return rc;
+                goto parse_end;
             }
 
             if (rc == NGX_ERROR) {
                 ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
                         "http parse status line error with peer: %V ",
                         &peer->check_peer_addr->name);
-                return rc;
+                goto parse_end;
             }
 
             code = ctx->status.code;
@@ -2578,16 +2579,44 @@ ngx_http_upstream_check_https_parse(ngx_http_upstream_check_peer_t *peer)
                     code_n, ucscf->code.status_alive);
 
             if (code_n & ucscf->code.status_alive) {
-                return NGX_OK;
+                rc = NGX_OK;
             } else {
-                return NGX_ERROR;
+                rc = NGX_ERROR;
             }
         } else {
-            return NGX_AGAIN;
+            rc = NGX_AGAIN;
         }
     } else {
-        return NGX_AGAIN;
+        rc = NGX_AGAIN;
     }
+
+parse_end:
+
+    switch (rc) {
+
+        case NGX_AGAIN:
+            /* The peer has closed its half side of the connection. */
+            return NGX_OK;
+
+        case NGX_ERROR:
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                    "check protocol %V error with peer: %V ",
+                    &peer->conf->check_type_conf->name,
+                    &peer->check_peer_addr->name);
+
+            ngx_http_upstream_check_status_update(peer, 0);
+            break;
+
+        case NGX_OK:
+            /* fall through */
+
+        default:
+            ngx_http_upstream_check_status_update(peer, 1);
+            break;
+    }
+
+    peer->state = NGX_HTTP_CHECK_RECV_DONE;
+    ngx_http_upstream_check_clean_event(peer);
 
     return NGX_OK;
 }

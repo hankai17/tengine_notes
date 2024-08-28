@@ -10,13 +10,17 @@ set print pretty
 #b ngx_http_upstream_check_send_handler_https_tls_hk_send
 #b ngx_http_upstream_check_http_parse_https_tls_hk_parse
 #b box_send
-#b box_flush
+b box_flush
 #b box_on_recv
 #b flush_wbio 
 
 #b ngx_http_upstream_check_module.c:2096
 
 #b box_on_send
-b ngx_http_upstream_check_send_https_handler
+#b ngx_http_upstream_check_send_https_handler
 #b ngx_http_upstream_check_recv_https_handler
 
+
+#http进来几次
+#b ngx_http_upstream_check_send_handler
+#b ngx_http_upstream_check_recv_handler
