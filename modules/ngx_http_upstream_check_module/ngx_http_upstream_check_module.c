@@ -184,7 +184,7 @@ typedef struct {
 
 
 typedef void (*ngx_http_upstream_check_send_handler_https_pt)
-    (ngx_event_t *event);
+    (ngx_event_t *event, uint8_t *buf, size_t len);
 typedef struct SSL_Box {
     int fd;
     SSL* _ssl;
@@ -206,12 +206,15 @@ typedef struct SSL_Box {
     ngx_event_t     *event;
 } SSL_Box;
 
-static void ngx_http_upstream_check_send_https_hk(ngx_event_t *event);
-static void ngx_http_upstream_check_send_https(ngx_event_t *event);
+static void ngx_http_upstream_check_https_send_hk(ngx_event_t *event);
+static void ngx_http_upstream_check_send_https(ngx_event_t *event, uint8_t *buf, size_t len);
 
-static void ngx_http_upstream_check_send_https_handler(ngx_event_t *event);
-static void ngx_http_upstream_check_recv_https_handler(ngx_event_t *event);
+static void ngx_http_upstream_check_https_send_handler(ngx_event_t *event);
+static void ngx_http_upstream_check_https_recv_handler(ngx_event_t *event);
 
+static ngx_int_t ngx_http_upstream_check_https_init(ngx_http_upstream_check_peer_t *peer);
+static ngx_buf_t *buffer_append_string(ngx_buf_t *b, u_char *s, size_t len, ngx_pool_t *pool);
+static void ngx_http_upstream_check_https_reinit(ngx_http_upstream_check_peer_t *peer);
 
 #define NGX_HTTP_CHECK_TCP                   0x0001
 #define NGX_HTTP_CHECK_HTTP                  0x0002
@@ -816,11 +819,11 @@ static ngx_check_conf_t  ngx_check_types[] = {
         ngx_string("https"),
         ngx_string("GET / HTTP/1.0\r\n\r\n"),
         NGX_CONF_BITMASK_SET | NGX_CHECK_HTTP_2XX | NGX_CHECK_HTTP_3XX,
-        ngx_http_upstream_check_send_https_handler,
-        ngx_http_upstream_check_recv_https_handler,
-        ngx_http_upstream_check_http_init,
+        ngx_http_upstream_check_https_send_handler,
+        ngx_http_upstream_check_https_recv_handler,
+        ngx_http_upstream_check_https_init,
         ngx_http_upstream_check_https_parse,
-        ngx_http_upstream_check_http_reinit,
+        ngx_http_upstream_check_https_reinit,
         1,
         1 },
 
@@ -1915,13 +1918,8 @@ void flush_wbio(SSL_Box* box) {
         return;
     }
 
-    memcpy(box->_buffer_send, buffer, total);
-    box->_buffer_send_size = total;
-    box->send(box->event);                                          // tls hankai1.3 发送client hello
+    box->send(box->event, buffer, total);               			// tls hankai1.3 发送client hello
 
-    ngx_http_upstream_check_ctx_t *ctx = box->peer->check_data;
-    ctx->send.pos = ctx->send.last = ctx->send.start;
-    box->_buffer_send_size = 0;
     //if (nread > 0) {
     //    flush_wbio(box);
     //}
@@ -1996,7 +1994,7 @@ void box_on_send(SSL_Box *box, uint8_t *buf, size_t size)
     box_flush(box);
 }
 
-static void ngx_http_upstream_check_send_https_handler(ngx_event_t *event)      // tls hankai0 建链成功|可发数据
+static void ngx_http_upstream_check_https_send_handler(ngx_event_t *event)      // tls hankai0 建链成功|可发数据
 {
     ngx_connection_t               *c;
     ngx_http_upstream_check_peer_t *peer;
@@ -2010,28 +2008,23 @@ static void ngx_http_upstream_check_send_https_handler(ngx_event_t *event)      
 
     int phase = peer->phase;
     if (phase == 0) {       // on connect
-        peer->phase = 2;
-        return ngx_http_upstream_check_send_https_hk(event);                    // tls hankai1 可发阶段1 发送client hello
-    }
-    if (phase == 1) {
-        peer->phase = 2;
-        ngx_connection_t *c = event->data;
-        peer = c->data;
-        box_flush(peer->box);
-        return;
-    }
-    if (phase == 2) {       // on send
-        ngx_connection_t *c = event->data;
-        peer = c->data;
+        peer->phase = 1;
+        ngx_http_upstream_check_https_send_hk(event);                    // tls hankai1 可发阶段1 发送client hello
+
         uint8_t req[] = "GET / HTTP/1.0\r\n\r\n";
         box_on_send(peer->box, req, sizeof(req)/sizeof(req[0]));
-        peer->phase = 0;
         event->active = 0;
         return;
     }
+    /*
+    if (peer->box) {
+        box_flush(peer->box);
+    }
+    */
+    return;
 }
 
-static void ngx_http_upstream_check_recv_https_handler(ngx_event_t *event)      // tls hankai2 接受server hello
+static void ngx_http_upstream_check_https_recv_handler(ngx_event_t *event)      // tls hankai2 接受server hello
 {
     u_char                         *new_buf;
     ssize_t                         size, n;
@@ -2107,7 +2100,9 @@ static void ngx_http_upstream_check_recv_https_handler(ngx_event_t *event)      
 
     ctx->recv.pos = ctx->recv.last = ctx->recv.start;
 
-    //peer->state = NGX_HTTP_CHECK_RECV_DONE;
+    if (peer->state == NGX_HTTP_CHECK_RECV_DONE) {
+        ngx_http_upstream_check_clean_event(peer);
+    }
     return;
 
 check_recv_fail:
@@ -2119,7 +2114,7 @@ check_recv_fail:
 }
 
     static void
-ngx_http_upstream_check_send_https_hk(ngx_event_t *event)                       // tls hankai1 调用ssl库 组client hello
+ngx_http_upstream_check_https_send_hk(ngx_event_t *event)                       // tls hankai1 调用ssl库 组client hello
 {
     ngx_connection_t               *c;
     ngx_http_upstream_check_peer_t *peer;
@@ -2139,8 +2134,8 @@ ngx_http_upstream_check_send_https_hk(ngx_event_t *event)                       
     box->_read_bio = BIO_new(BIO_s_mem());
     box->_write_bio = BIO_new(BIO_s_mem());
 
-    box->ctx = SSL_CTX_new(SSLv23_client_method()); // free TODO
-    box->_ssl = SSL_new(box->ctx);   // free TODO
+    box->ctx = SSL_CTX_new(SSLv23_client_method());
+    box->_ssl = SSL_new(box->ctx);
 
     SSL_set_bio(box->_ssl, box->_read_bio, box->_write_bio);
     SSL_set_connect_state(box->_ssl);
@@ -2169,7 +2164,7 @@ ngx_http_upstream_check_send_https_hk(ngx_event_t *event)                       
 }
 
     static void
-ngx_http_upstream_check_send_https(ngx_event_t *event)          // tls hankai1.3 发送client hello
+ngx_http_upstream_check_send_https(ngx_event_t *event, uint8_t *buf, size_t len)          // tls hankai1.3 发送client hello
 {
     ssize_t                         size;
     ngx_connection_t               *c;
@@ -2232,8 +2227,7 @@ ngx_http_upstream_check_send_https(ngx_event_t *event)          // tls hankai1.3
             "http check send total: %z",
             ctx->send.last - ctx->send.pos);
 
-    ctx->send.pos = box->_buffer_send;
-    ctx->send.last = box->_buffer_send + box->_buffer_send_size;
+    buffer_append_string(&ctx->send, buf, len, peer->pool);
 
     while (ctx->send.pos < ctx->send.last) {
 
@@ -2495,6 +2489,77 @@ check_recv_fail:
     ngx_http_upstream_check_clean_event(peer);
 }
 
+static ngx_buf_t *
+buffer_append_string(ngx_buf_t *b, u_char *s, size_t len, ngx_pool_t *pool)
+{
+    u_char     *p;
+    ngx_uint_t capacity, size;
+
+    if (len > (size_t) (b->end - b->last)) {
+
+        size = b->last - b->pos;
+
+        capacity = b->end - b->start;
+        capacity <<= 1;
+
+        if (capacity < (size + len)) {
+            capacity = size + len;
+        }
+
+        p = ngx_palloc(pool, capacity);
+        if (p == NULL) {
+            return NULL;
+        }
+
+        b->last = ngx_copy(p, b->pos, size);
+
+        b->start = b->pos = p;
+        b->end = p + capacity;
+    }
+
+    b->last = ngx_copy(b->last, s, len);
+
+    return b;
+}
+
+/*
+static void
+ngx_http_upstream_check_https_input_send_buffer(ngx_http_upstream_check_peer_t *peer,
+        uint8_t *buf, size_t size)
+{
+    ngx_http_upstream_check_ctx_t       *ctx;
+
+    ctx = peer->check_data;
+	ngx_buf_t *b = &ctx->send;
+
+	buffer_append_string(b, buf, size, peer->pool);
+}
+*/
+
+    static ngx_int_t
+ngx_http_upstream_check_https_init(ngx_http_upstream_check_peer_t *peer)
+{
+    ngx_buf_t                           *b;
+    ngx_http_upstream_check_ctx_t       *ctx;
+    //ngx_http_upstream_check_srv_conf_t  *ucscf;
+
+    ctx = peer->check_data;
+    //ucscf = peer->conf;
+
+    b = ngx_create_temp_buf(peer->pool, 1024 * 4);
+    //ctx->send.start = ctx->send.pos = ctx->send.last = b->start;
+    //ctx->send.end = b->end;
+	ctx->send = *b;
+
+    ctx->recv.start = ctx->recv.pos = NULL;
+    ctx->recv.end = ctx->recv.last = NULL;
+
+    ctx->state = 0;
+
+    ngx_memzero(&ctx->status, sizeof(ngx_http_status_t));
+
+    return NGX_OK;
+}
 
     static ngx_int_t
 ngx_http_upstream_check_http_init(ngx_http_upstream_check_peer_t *peer)
@@ -2616,7 +2681,7 @@ parse_end:
     }
 
     peer->state = NGX_HTTP_CHECK_RECV_DONE;
-    ngx_http_upstream_check_clean_event(peer);
+    //ngx_http_upstream_check_clean_event(peer);
 
     return NGX_OK;
 }
@@ -3395,6 +3460,43 @@ done:
     return NGX_OK;
 }
 
+static void
+ngx_http_upstream_check_https_free(SSL_Box *box)
+{
+    if (box == NULL) {
+        return;
+    }
+    if (box->_ssl) {
+        SSL_free(box->_ssl);
+    }
+    if (box->ctx) {
+        SSL_CTX_free(box->ctx);
+    }
+
+    free(box);
+    return;
+}
+    static void
+ngx_http_upstream_check_https_reinit(ngx_http_upstream_check_peer_t *peer)
+{
+    ngx_http_upstream_check_ctx_t  *ctx;
+
+    ctx = peer->check_data;
+
+    ctx->send.pos = ctx->send.last = ctx->send.start;
+
+    ctx->recv.pos = ctx->recv.last = ctx->recv.start;
+
+    ctx->state = 0;
+
+    peer->phase = 0;
+
+    ngx_http_upstream_check_https_free(peer->box);
+
+    peer->box = NULL;
+
+    ngx_memzero(&ctx->status, sizeof(ngx_http_status_t));
+}
 
     static void
 ngx_http_upstream_check_http_reinit(ngx_http_upstream_check_peer_t *peer)
