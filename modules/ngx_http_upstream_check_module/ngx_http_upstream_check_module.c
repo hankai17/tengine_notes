@@ -2406,33 +2406,15 @@ buffer_append_string(ngx_buf_t *b, u_char *s, size_t len, ngx_pool_t *pool)
     return b;
 }
 
-/*
-static void
-ngx_http_upstream_check_https_input_send_buffer(ngx_http_upstream_check_peer_t *peer,
-        uint8_t *buf, size_t size)
-{
-    ngx_http_upstream_check_ctx_t       *ctx;
-
-    ctx = peer->check_data;
-	ngx_buf_t *b = &ctx->send;
-
-	buffer_append_string(b, buf, size, peer->pool);
-}
-*/
-
 static ngx_int_t
 ngx_http_upstream_check_https_init(ngx_http_upstream_check_peer_t *peer)
 {
     ngx_buf_t                           *b;
     ngx_http_upstream_check_ctx_t       *ctx;
-    //ngx_http_upstream_check_srv_conf_t  *ucscf;
 
     ctx = peer->check_data;
-    //ucscf = peer->conf;
 
     b = ngx_create_temp_buf(peer->pool, 1024 * 4);
-    //ctx->send.start = ctx->send.pos = ctx->send.last = b->start;
-    //ctx->send.end = b->end;
     ctx->send = *b;
 
     ctx->recv.start = ctx->recv.pos = NULL;
