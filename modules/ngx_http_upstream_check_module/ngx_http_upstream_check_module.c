@@ -82,7 +82,6 @@ typedef struct {
 
     size_t                                   padding;
     size_t                                   length;
-    SSL_Box                                 *box;
 } ngx_http_upstream_check_ctx_t;
 
 
@@ -396,7 +395,7 @@ static ngx_http_fastcgi_request_start_t  ngx_http_fastcgi_request_start = {
 #define PEER_DELETING 0x01
 #define PEER_DELETED  0x02
 
-static void ngx_http_upstream_check_https_send_hk(ngx_event_t *event);
+static ngx_int_t ngx_http_upstream_check_https_send_hk(ngx_event_t *event);
 static void ngx_http_upstream_check_https_send(ngx_event_t *event, uint8_t *buf, size_t len);
 static ngx_buf_t *buffer_append_string(ngx_buf_t *b, u_char *s, size_t len, ngx_pool_t *pool);
 
@@ -1844,7 +1843,6 @@ ngx_http_upstream_check_https_send(ngx_event_t *event, uint8_t *buf, size_t len)
 
     c = event->data;
     peer = c->data;
-    SSL_Box *box = peer->box;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "http check send.");
 
@@ -1888,7 +1886,6 @@ ngx_http_upstream_check_https_send(ngx_event_t *event, uint8_t *buf, size_t len)
     }
 
     ctx = peer->check_data;
-    ctx->box = box;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "http check send total: %z",
@@ -1928,7 +1925,7 @@ ngx_http_upstream_check_https_send(ngx_event_t *event, uint8_t *buf, size_t len)
 
     return;
 
-    check_send_fail:
+check_send_fail:
     ngx_http_upstream_check_status_update(peer, 0);
     ngx_http_upstream_check_clean_event(peer);
 }
@@ -2165,6 +2162,7 @@ flush_rbio(SSL_Box* box)
 
     uint8_t buffer[1024 * 4] = {0};
     int buf_size = 1024 * 4 - 1;
+
     do {
         nread = SSL_read(box->_ssl, buffer + total, buf_size - total);
         if (nread > 0) {
@@ -2182,6 +2180,7 @@ flush_rbio(SSL_Box* box)
     ngx_http_upstream_check_ctx_t *ctx = box->peer->check_data;
     ctx->recv.pos = box->_buffer_recv;
     ctx->recv.last = box->_buffer_recv + total;
+
     box->parse(box->peer);
 
     ctx->recv.pos = ctx->recv.last = ctx->recv.start;
@@ -2197,6 +2196,7 @@ flush_wbio(SSL_Box* box)
 
     uint8_t buffer[1024 * 4] = {0};
     int buf_size = 1024 * 4 - 1;
+
     do {
         nread = BIO_read(box->_write_bio, buffer + total, buf_size - total);
         if (nread > 0) {
@@ -2218,8 +2218,11 @@ box_flush(SSL_Box* box)
     if (box->_is_flush) {
         return;
     }
+
     box->_is_flush = 1;
+
     flush_rbio(box);
+
     if (!SSL_is_init_finished(box->_ssl)) {
         flush_wbio(box);
         box->_is_flush = 0;
@@ -2243,18 +2246,25 @@ box_flush(SSL_Box* box)
             break;
         }
     } while(0);
+
     box->_is_flush = 0;
 }
 
 
-static void
+static ngx_int_t
 ngx_http_upstream_check_https_send_hk(ngx_event_t *event)
 {
     ngx_connection_t               *c;
     ngx_http_upstream_check_peer_t *peer;
 
-    SSL_Box *box = (SSL_Box*) malloc(sizeof(SSL_Box));
+    SSL_Box *box = (SSL_Box*)malloc(sizeof(SSL_Box));
+
+    if (box == NULL) {
+        return NGX_ERROR;
+    }
+
     memset(box, 0x0, sizeof(SSL_Box));
+
     box->_read_bio = BIO_new(BIO_s_mem());
     box->_write_bio = BIO_new(BIO_s_mem());
 
@@ -2265,25 +2275,30 @@ ngx_http_upstream_check_https_send_hk(ngx_event_t *event)
     SSL_set_connect_state(box->_ssl);
 
     box->_buff_size = 1024 * 4;
+
     memset(box->_buffer_send, 0x0, 1024 * 4);
 
     c = event->data;
     peer = c->data;
-    box->peer = peer;
     peer->box = box;
+
+    box->peer = peer;
     box->event = event;
+
     box->parse = ngx_http_upstream_check_https_parse;
     box->send = ngx_http_upstream_check_https_send;
 
     if (peer->conf->server_name.len > 0) {
         SSL_set_tlsext_host_name(box->_ssl, peer->conf->server_name.data);
     }
+
     SSL_connect(box->_ssl);
+
     box->_is_flush = 0;
 
     box_flush(box);
 
-    return;
+    return NGX_OK;
 }
 
 
@@ -2293,6 +2308,7 @@ box_on_send(SSL_Box *box, uint8_t *buf, size_t size)
     if (size <= 0) {
         return;
     }
+
     memcpy(box->_buffer_send, buf, size);
     box->_buffer_send_size = size;
     box_flush(box);
@@ -2312,15 +2328,48 @@ ngx_http_upstream_check_https_send_handler(ngx_event_t *event)
     c = event->data;
     peer = c->data;
 
-    int phase = peer->phase;
-    if (phase == 0) {
-        peer->phase = 1;
-        ngx_http_upstream_check_https_send_hk(event);
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "https check send.");
+
+    if (c->pool == NULL) {
+        ngx_log_error(NGX_LOG_ERR, event->log, 0,
+                      "check pool NULL with peer: %V ",
+                      &peer->check_peer_addr->name);
+
+        goto check_send_fail;
+    }
+
+    if (peer->state != NGX_HTTP_CHECK_CONNECT_DONE) {
+        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+
+            ngx_log_error(NGX_LOG_ERR, event->log, 0,
+                          "check handle write event error with peer: %V ",
+                          &peer->check_peer_addr->name);
+
+            goto check_send_fail;
+        }
+
+        return;
+    }
+
+    if (peer->phase == 0) {
+
         ngx_http_upstream_check_srv_conf_t  *ucscf;
         ucscf = peer->conf;
+
+        peer->phase = 1;
+
+        if (ngx_http_upstream_check_https_send_hk(event) != NGX_OK) {
+            goto check_send_fail;
+        }
+
         box_on_send(peer->box, (u_char *)ucscf->send.data, ucscf->send.len);
     }
+
     return;
+
+check_send_fail:
+    ngx_http_upstream_check_status_update(peer, 0);
+    ngx_http_upstream_check_clean_event(peer);
 }
 
 
@@ -2542,74 +2591,74 @@ ngx_http_upstream_check_https_parse(ngx_http_upstream_check_peer_t *peer)
 
     ucscf = peer->conf;
     ctx = peer->check_data;
-    box = ctx->box;
+    box = peer->box;
 
-    if ((ctx->recv.last - ctx->recv.pos) > 0) {
+    if ((ctx->recv.last - ctx->recv.pos) <= 0) {
+        rc = NGX_AGAIN;
+        goto parse_end;
+    } 
 
-        BIO_write(box->_read_bio, ctx->recv.pos, ctx->recv.last - ctx->recv.pos);
-        box_flush(box);
+    BIO_write(box->_read_bio, ctx->recv.pos, ctx->recv.last - ctx->recv.pos);
+    box_flush(box);
 
-        if (box->_buffer_recv_size) {
+    if (box->_buffer_recv_size) {
 
-            ctx->recv.pos = box->_buffer_recv;
-            ctx->recv.last = box->_buffer_recv + box->_buffer_recv_size;
+        ctx->recv.pos = box->_buffer_recv;
+        ctx->recv.last = box->_buffer_recv + box->_buffer_recv_size;
 
-            rc = ngx_http_upstream_check_parse_status_line(ctx,
-                                                           &ctx->recv,
-                                                           &ctx->status);
-            if (rc == NGX_AGAIN) {
-                goto parse_end;
-            }
+        rc = ngx_http_upstream_check_parse_status_line(ctx,
+                                                       &ctx->recv,
+                                                       &ctx->status);
+        if (rc == NGX_AGAIN) {
+            goto parse_end;
+        }
 
-            if (rc == NGX_ERROR) {
-                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                              "http parse status line error with peer: %V ",
-                              &peer->check_peer_addr->name);
-                goto parse_end;
-            }
+        if (rc == NGX_ERROR) {
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                          "http parse status line error with peer: %V ",
+                          &peer->check_peer_addr->name);
+            goto parse_end;
+        }
 
-            code = ctx->status.code;
+        code = ctx->status.code;
 
-            if (code > 0 && code < 200) {
-                code_n = NGX_CHECK_HTTP_1XX;
-            } else if (code >= 200 && code < 300) {
-                code_n = NGX_CHECK_HTTP_2XX;
-            } else if (code >= 300 && code < 400) {
-                code_n = NGX_CHECK_HTTP_3XX;
-            } else if (code >= 400 && code < 500) {
-                peer->pc.connection->error = 1;
-                code_n = NGX_CHECK_HTTP_4XX;
-            } else if (code >= 500 && code < 600) {
-                peer->pc.connection->error = 1;
-                code_n = NGX_CHECK_HTTP_5XX;
-            } else {
-                peer->pc.connection->error = 1;
-                code_n = NGX_CHECK_HTTP_ERR;
-            }
-
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                           "http_parse: code_n: %ui, conf: %ui",
-                           code_n, ucscf->code.status_alive);
-
-            if (code_n & ucscf->code.status_alive) {
-                rc = NGX_OK;
-            } else {
-                rc = NGX_ERROR;
-            }
+        if (code > 0 && code < 200) {
+            code_n = NGX_CHECK_HTTP_1XX;
+        } else if (code >= 200 && code < 300) {
+            code_n = NGX_CHECK_HTTP_2XX;
+        } else if (code >= 300 && code < 400) {
+            code_n = NGX_CHECK_HTTP_3XX;
+        } else if (code >= 400 && code < 500) {
+            peer->pc.connection->error = 1;
+            code_n = NGX_CHECK_HTTP_4XX;
+        } else if (code >= 500 && code < 600) {
+            peer->pc.connection->error = 1;
+            code_n = NGX_CHECK_HTTP_5XX;
         } else {
-            rc = NGX_AGAIN;
+            peer->pc.connection->error = 1;
+            code_n = NGX_CHECK_HTTP_ERR;
+        }
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                       "http_parse: code_n: %ui, conf: %ui",
+                       code_n, ucscf->code.status_alive);
+
+        if (code_n & ucscf->code.status_alive) {
+            rc = NGX_OK;
+        } else {
+            rc = NGX_ERROR;
         }
     } else {
         rc = NGX_AGAIN;
     }
 
-    parse_end:
+parse_end:
 
     switch (rc) {
 
         case NGX_AGAIN:
             /* The peer has closed its half side of the connection. */
-            return NGX_OK;
+            /* so bad we will fall through */
 
         case NGX_ERROR:
             ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
@@ -2629,7 +2678,6 @@ ngx_http_upstream_check_https_parse(ngx_http_upstream_check_peer_t *peer)
     }
 
     peer->state = NGX_HTTP_CHECK_RECV_DONE;
-    //ngx_http_upstream_check_clean_event(peer);
 
     return NGX_OK;
 }
